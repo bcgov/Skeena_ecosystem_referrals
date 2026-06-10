@@ -38,6 +38,7 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+.env
 
 # pkgdown site
 docs/
@@ -47,3 +48,24 @@ po/*~
 
 # RStudio Connect folder
 rsconnect/
+
+# Data files (large/sensitive)
+data/input/*.gpkg
+data/input/*.shp
+data/input/*.geojson
+data/input/*.tif
+data/output/
+
+# Quarto output
+_site/
+_book/
+*_files/
+*.html
+*.pdf
+*.docx
+/.quarto/
+**/*.quarto_ipynb
+
+# System files
+.DS_Store
+Thumbs.db
