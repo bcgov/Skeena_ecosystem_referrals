@@ -1,0 +1,520 @@
+---
+title: "BC Gov Referral Spatial Analysis Report"
+author: "BC Government Referral Process"
+date: today
+format:
+  html:
+    toc: true
+    toc-depth: 3
+    number-sections: true
+    theme: cosmo
+    embed-resources: false
+    code-fold: true
+    code-summary: "Show code"
+params:
+  geomark_input: "https://apps.gov.bc.ca/pub/geomark/geomarks/gm-723966ECBECD4FE698C92C9D079F2474"
+  config_path: "referral_layers.xlsx"
+  interactive_maps: false
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = FALSE,
+  warning = FALSE,
+  message = FALSE,
+  fig.width = 10,
+  fig.height = 8
+)
+
+utils_files <- c(
+  "R/utils_core.R",
+  "R/utils_layers.R",
+  "R/utils_analysis_polygon.R",
+  "R/utils_analysis_line.R",
+  "R/utils_analysis_proximity.R",
+  "R/utils_analysis_special.R",
+  "R/utils_report_helpers.R"
+)
+invisible(lapply(utils_files, source))
+setup_packages()
+```
+
+```{html}
+<style>
+details {
+  margin: 1.5em 0;
+  padding: 0.5em 0.5em 0;
+  border: 1px solid #ddd;
+  border-radius: 4px;
+  background-color: #f9f9f9;
+}
+
+details summary {
+  cursor: pointer;
+  font-weight: 600;
+  color: #0066cc;
+  padding: 0.5em;
+  margin: -0.5em -0.5em 0 -0.5em;
+  border-radius: 4px 4px 0 0;
+  background-color: #f0f7ff;
+  user-select: none;
+}
+
+details summary:hover {
+  background-color: #e6f0ff;
+}
+
+details > *:not(summary) {
+  margin: 0.5em 0;
+}
+</style>
+<script>
+document.addEventListener("DOMContentLoaded", function () {
+  document.querySelectorAll("p").forEach(function (p) {
+    if (p.textContent && p.textContent.trim() === "NULL") {
+      p.remove();
+    }
+  });
+});
+</script>
+```
+
+# Overview
+
+This report provides an automated spatial analysis of reference layers against
+a referral Area of Interest (AOI). The AOI is loaded from a BC Geomark URL or
+a local spatial file, and each configured reference layer is checked for
+overlap or proximity.
+
+- **Analysis date:** `r Sys.Date()`
+- **Proximity analysis distance:** layer-specific values from `Distance_outside_plot` in the configured layers workbook
+- **Map mode:** `r if (isTRUE(params$interactive_maps)) "Interactive (leaflet)" else "Static (ggplot2)"`
+
+# Load AOI
+
+```{r load-aoi}
+if (params$geomark_input == "") {
+  stop(
+    "No geomark input provided. Set the 'geomark_input' parameter to a ",
+    "geomark URL or local file path.\n\n",
+    "Example usage:\n",
+    "  quarto render referral_analysis.qmd ",
+    "-P geomark_input:https://apps.gov.bc.ca/pub/geomark/geomarks/gm-abc123"
+  )
+}
+
+aoi <- load_geomark(params$geomark_input)
+aoi_geom_type <- get_geometry_type(aoi)
+aoi_area_ha <- if (aoi_geom_type == "polygon") {
+  as.numeric(sf::st_area(sf::st_union(aoi))) / 10000
+} else {
+  NA
+}
+aoi_length_km <- if (aoi_geom_type == "line") {
+  as.numeric(sf::st_length(sf::st_union(aoi))) / 1000
+} else {
+  NA
+}
+```
+
+**AOI geometry type:** `r aoi_geom_type`
+
+```{r aoi-summary, results='asis'}
+if (aoi_geom_type == "polygon") {
+  cat(sprintf("**AOI area:** %.2f ha (%.4f km²)\n", aoi_area_ha, aoi_area_ha / 100))
+} else if (aoi_geom_type == "line") {
+  cat(sprintf("**AOI length:** %.2f km\n", aoi_length_km))
+}
+```
+
+## AOI Map
+
+```{r aoi-map, out.height="500px"}
+if (isTRUE(params$interactive_maps)) {
+  render_leaflet_widget(build_aoi_leaflet(aoi))
+} else {
+  print(
+    ggplot2::ggplot() +
+      ggplot2::geom_sf(data = aoi, fill = "steelblue", alpha = 0.3, colour = "navy") +
+      ggplot2::theme_minimal() +
+      ggplot2::labs(title = "Referral Area of Interest (AOI)")
+  )
+}
+```
+
+# Reference Layer Analysis
+
+```{r load-config, results='asis'}
+init_layers <- initialize_referral_layers(config_path = params$config_path)
+config <- init_layers$config
+cat(sprintf("**Configured layers:** %d\n\n", nrow(config)))
+```
+
+```{r run-analysis, results='asis'}
+layer_outputs <- list()
+results <- list()
+no_hit_layers <- list()
+skipped_layers <- list()
+
+for (i in seq_len(nrow(config))) {
+  layer_info <- config[i, ]
+  layer_name <- as.character(layer_info$layer_name)
+  layer_display <- if ("name" %in% names(layer_info)) as.character(layer_info$name) else layer_name
+  layer_path <- as.character(layer_info$layer_path)
+  layer_geom <- as.character(layer_info$geometry_type)
+  layer_focus <- if ("focus" %in% names(layer_info)) as.character(layer_info$focus) else "Unspecified"
+  spatial_need <- if (aoi_geom_type == "polygon") {
+    as.character(layer_info$spatial_information_polygon)
+  } else {
+    as.character(layer_info$spatial_information_linestring)
+  }
+
+  fields <- NULL
+  if ("fields_to_extract" %in% names(layer_info)) {
+    fields <- layer_info$fields_to_extract[[1]]
+  }
+  if (is.null(fields)) {
+    fields <- parse_key_values(if ("key_values" %in% names(layer_info)) as.character(layer_info$key_values) else NA_character_)
+  }
+
+  outside_distance <- NA_real_
+  if ("distance_outside_m" %in% names(layer_info)) {
+    outside_distance <- suppressWarnings(as.numeric(layer_info$distance_outside_m))
+  }
+
+  lyr <- load_layer(
+    layer_path,
+    layer_type = if ("layer_type" %in% names(layer_info)) as.character(layer_info$layer_type) else "file",
+    geometry_type = layer_geom,
+    fields_to_extract = fields,
+    bcdc_id = if ("bcdc_id" %in% names(layer_info)) as.character(layer_info$bcdc_id) else NA_character_,
+    layer_name = if ("name" %in% names(layer_info)) as.character(layer_info$name) else layer_name,
+    layer_identifier = if ("layer_identifier" %in% names(layer_info)) as.character(layer_info$layer_identifier) else NA_character_,
+    search_dir = "data/input",
+    cache_bcdc = TRUE
+  )
+  if (is.null(lyr)) {
+    skipped_layers[[length(skipped_layers) + 1]] <- list(
+      focus = layer_focus,
+      layer_display = layer_display,
+      geometry = layer_geom,
+      reason = "Layer could not be loaded (missing local file or inaccessible BCDC source)"
+    )
+    next
+  }
+
+  direct_res <- NULL
+  analysis_type <- NA_character_
+  has_direct <- FALSE
+
+  if (aoi_geom_type == "polygon") {
+    if (layer_geom == "polygon") {
+      direct_res <- polygon_overlap(aoi, lyr, fields)
+      analysis_type <- "polygon_overlap"
+      has_direct <- !is.null(direct_res)
+    } else if (layer_geom == "line") {
+      direct_res <- line_density_in_polygon(aoi, lyr, fields)
+      analysis_type <- "line_density"
+      has_direct <- !is.null(direct_res)
+    } else if (layer_geom == "point") {
+      direct_res <- points_in_polygon(aoi, lyr, fields)
+      analysis_type <- "points_in_polygon"
+      has_direct <- !is.null(direct_res)
+    } else if (layer_geom == "raster") {
+      direct_res <- raster_overlap(aoi, lyr)
+      analysis_type <- "raster_overlap"
+      has_direct <- !is.null(direct_res)
+    }
+  } else if (aoi_geom_type == "line") {
+    if (layer_geom == "polygon") {
+      direct_res <- line_polygon_overlap(aoi, lyr, fields)
+      analysis_type <- "line_polygon_overlap"
+      has_direct <- !is.null(direct_res)
+    } else if (layer_geom == "line") {
+      direct_res <- line_line_intersection(aoi, lyr, fields)
+      analysis_type <- "line_intersection"
+      has_direct <- !is.null(direct_res)
+    } else if (layer_geom == "raster") {
+      direct_res <- line_raster_overlap(aoi, lyr)
+      analysis_type <- "line_raster_overlap"
+      has_direct <- !is.null(direct_res)
+    }
+  }
+
+  nearby_res <- NULL
+  if (!is.na(outside_distance) && outside_distance > 0 && layer_geom != "raster") {
+    nearby_res <- features_within_buffer(aoi, lyr, outside_distance, fields)
+  }
+  has_nearby <- !is.null(nearby_res)
+
+  plot_vector <- NULL
+  plot_raster <- NULL
+  if (layer_geom == "raster") {
+    plot_raster <- tryCatch(
+      prepare_raster_plot_data(lyr, aoi, outside_distance),
+      error = function(e) NULL
+    )
+  } else {
+    context_pad <- if (is.na(outside_distance) || outside_distance <= 0) 500 else outside_distance
+
+    if (has_direct) {
+      plot_vector <- tryCatch(
+        sf::st_filter(lyr, sf::st_union(aoi), .predicate = sf::st_intersects),
+        error = function(e) NULL
+      )
+    }
+
+    if ((is.null(plot_vector) || nrow(plot_vector) == 0) && has_nearby) {
+      plot_vector <- tryCatch(
+        sf::st_filter(lyr, sf::st_buffer(sf::st_union(aoi), dist = outside_distance), .predicate = sf::st_intersects),
+        error = function(e) NULL
+      )
+    }
+
+    if (!is.null(plot_vector) && nrow(plot_vector) > 0) {
+      plot_vector <- tryCatch(
+        crop_to_aoi_context(plot_vector, aoi, pad_dist = context_pad),
+        error = function(e) plot_vector
+      )
+    } else {
+      plot_vector <- NULL
+    }
+  }
+
+  if (!has_direct && !has_nearby) {
+    no_hit_layers[[length(no_hit_layers) + 1]] <- list(
+      focus = layer_focus,
+      layer_display = layer_display,
+      geometry = layer_geom,
+      outside_distance_m = outside_distance
+    )
+    rm(lyr, plot_vector, plot_raster)
+    invisible(gc(verbose = FALSE))
+    next
+  }
+
+  results[[layer_name]] <- format_result(layer_name, analysis_type, direct_res, has_direct)
+  layer_outputs[[length(layer_outputs) + 1]] <- list(
+    focus = layer_focus,
+    layer_name = layer_name,
+    layer_display = layer_display,
+    layer_geom = layer_geom,
+    spatial_need = spatial_need,
+    analysis_type = analysis_type,
+    direct = direct_res,
+    has_direct = has_direct,
+    map_geom = plot_vector,
+    raster_plot_data = plot_raster,
+    nearby = nearby_res,
+    outside_distance = outside_distance
+  )
+
+  rm(lyr, plot_vector, plot_raster)
+  invisible(gc(verbose = FALSE))
+}
+
+if (length(layer_outputs) == 0) {
+  cat("*No configured layers intersected the AOI (or configured outside distances).*\n\n")
+} else {
+  focus_order <- unique(vapply(layer_outputs, function(x) x$focus, character(1)))
+
+  for (focus in focus_order) {
+    cat(sprintf("\n## Focus: %s\n\n", focus))
+    focus_layers <- Filter(function(x) identical(x$focus, focus), layer_outputs)
+
+    for (entry in focus_layers) {
+      spatial_need_clean <- trimws(gsub("^\\*+|\\*+$", "", entry$spatial_need))
+      cat(sprintf("### %s\n\n", entry$layer_display))
+      cat(sprintf("**Geometry type:** %s\n\n", entry$layer_geom))
+      cat(sprintf("**Requested spatial info:** %s\n\n", spatial_need_clean))
+
+      if (isTRUE(params$interactive_maps)) {
+        lmap <- build_layer_leaflet(
+          aoi = aoi,
+          aoi_geom_type = aoi_geom_type,
+          layer_display = entry$layer_display,
+          layer_geom = entry$layer_geom,
+          plot_vector = entry$map_geom,
+          plot_raster = entry$raster_plot_data
+        )
+        if (!is.null(lmap)) {
+          cat("#### Analysis Map\n\n")
+          render_leaflet_widget(lmap)
+          cat("\n\n")
+        }
+      } else {
+        layer_plot <- build_layer_plot(
+          aoi = aoi,
+          aoi_geom_type = aoi_geom_type,
+          layer_display = entry$layer_display,
+          layer_geom = entry$layer_geom,
+          plot_vector = entry$map_geom,
+          plot_raster = entry$raster_plot_data
+        )
+        if (!is.null(layer_plot)) {
+          cat("#### Analysis Map\n\n")
+          print(layer_plot)
+          cat("\n\n")
+        }
+      }
+
+      if (entry$has_direct) {
+        if (entry$analysis_type == "polygon_overlap") {
+          cat("#### Overlap details\n\n")
+          polygon_totals <- attr(entry$direct, "coverage_summary", exact = TRUE)
+          if (is.null(polygon_totals)) {
+            polygon_totals <- data.frame(
+              total_overlap_area_ha = sum(entry$direct$overlap_area_ha, na.rm = TRUE),
+              total_overlap_pct = if (!is.na(aoi_area_ha) && aoi_area_ha > 0) {
+                (sum(entry$direct$overlap_area_ha, na.rm = TRUE) / aoi_area_ha) * 100
+              } else {
+                NA_real_
+              }
+            )
+          }
+          { render_table(polygon_totals, caption = paste(entry$layer_display, "- Total Overlap")); invisible(NULL) }
+          cat("\n\n")
+          { render_grouped_tables(entry$direct, caption_prefix = paste(entry$layer_display, "- Overlap")); invisible(NULL) }
+          cat("\n\n")
+        } else if (entry$analysis_type == "line_density") {
+          cat("#### Line density and type\n\n")
+          { render_table(entry$direct$summary, caption = paste(entry$layer_display, "- Total Length and Density")); invisible(NULL) }
+          cat("\n\n")
+          { render_grouped_tables(entry$direct$details, caption_prefix = paste(entry$layer_display, "- Features")); invisible(NULL) }
+          cat("\n\n")
+        } else if (entry$analysis_type == "points_in_polygon") {
+          cat(sprintf("#### Points in AOI: %d\n\n", entry$direct$count))
+          points_totals <- data.frame(total_point_count = entry$direct$count)
+          { render_table(points_totals, caption = paste(entry$layer_display, "- Total Points")); invisible(NULL) }
+          cat("\n\n")
+          { render_grouped_tables(entry$direct$details, caption_prefix = paste(entry$layer_display, "- Points")); invisible(NULL) }
+          cat("\n\n")
+        } else if (entry$analysis_type == "raster_overlap") {
+          cat("#### Raster value percentages in AOI\n\n")
+          raster_totals <- data.frame(
+            raster_classes = nrow(entry$direct),
+            total_cells = if ("count" %in% names(entry$direct)) sum(entry$direct$count, na.rm = TRUE) else NA_real_,
+            total_pct_of_aoi = if ("pct_of_aoi" %in% names(entry$direct)) sum(entry$direct$pct_of_aoi, na.rm = TRUE) else NA_real_
+          )
+          { render_table(raster_totals, caption = paste(entry$layer_display, "- Total Raster Coverage")); invisible(NULL) }
+          cat("\n\n")
+          { render_table(entry$direct, caption = paste(entry$layer_display, "- Raster Overlap")); invisible(NULL) }
+          cat("\n\n")
+        } else if (entry$analysis_type == "line_polygon_overlap") {
+          cat("#### Line overlap length\n\n")
+          line_polygon_totals <- attr(entry$direct, "coverage_summary", exact = TRUE)
+          if (is.null(line_polygon_totals)) {
+            overlap_total_km <- sum(entry$direct$overlap_length_km, na.rm = TRUE)
+            line_polygon_totals <- data.frame(
+              total_overlap_length_km = overlap_total_km,
+              total_pct_of_aoi_line = if (!is.na(aoi_length_km) && aoi_length_km > 0) (overlap_total_km / aoi_length_km) * 100 else NA_real_
+            )
+          }
+          { render_table(line_polygon_totals, caption = paste(entry$layer_display, "- Total Overlap Length")); invisible(NULL) }
+          cat("\n\n")
+          { render_grouped_tables(entry$direct, caption_prefix = paste(entry$layer_display, "- Overlap Length")); invisible(NULL) }
+          cat("\n\n")
+        } else if (entry$analysis_type == "line_intersection") {
+          cat("#### Intersecting linear features\n\n")
+          intersection_totals <- data.frame(total_intersection_count = sum(entry$direct$intersection_count, na.rm = TRUE))
+          { render_table(intersection_totals, caption = paste(entry$layer_display, "- Total Intersections")); invisible(NULL) }
+          cat("\n\n")
+          { render_grouped_tables(entry$direct, caption_prefix = paste(entry$layer_display, "- Intersections")); invisible(NULL) }
+        } else if (entry$analysis_type == "line_raster_overlap") {
+          cat("#### Raster overlap length along line\n\n")
+          line_raster_totals <- data.frame(
+            total_overlap_length_km = sum(entry$direct$overlap_length_km, na.rm = TRUE),
+            total_pct_of_line = if ("pct_of_line" %in% names(entry$direct)) sum(entry$direct$pct_of_line, na.rm = TRUE) else NA_real_
+          )
+          { render_table(line_raster_totals, caption = paste(entry$layer_display, "- Total Raster Overlap")); invisible(NULL) }
+          cat("\n\n")
+          { render_table(entry$direct, caption = paste(entry$layer_display, "- Raster Along Line")); invisible(NULL) }
+          cat("\n\n")
+        }
+      }
+
+      if (!is.null(entry$nearby)) {
+        cat(sprintf("#### Features within %.0f m outside AOI\n\n", entry$outside_distance))
+        if ("feature_count" %in% names(entry$nearby)) {
+          total_nearby <- sum(entry$nearby$feature_count, na.rm = TRUE)
+          weighted_mean_dist <- if (total_nearby > 0 && "mean_distance_m" %in% names(entry$nearby)) {
+            sum(entry$nearby$mean_distance_m * entry$nearby$feature_count, na.rm = TRUE) / total_nearby
+          } else {
+            NA_real_
+          }
+          nearby_totals <- data.frame(
+            total_nearby_features = total_nearby,
+            min_distance_m = if ("min_distance_m" %in% names(entry$nearby)) min(entry$nearby$min_distance_m, na.rm = TRUE) else NA_real_,
+            mean_distance_m = weighted_mean_dist,
+            max_distance_m = if ("max_distance_m" %in% names(entry$nearby)) max(entry$nearby$max_distance_m, na.rm = TRUE) else NA_real_
+          )
+        } else {
+          nearby_totals <- data.frame(
+            total_nearby_features = nrow(entry$nearby),
+            min_distance_m = if ("distance_m" %in% names(entry$nearby)) min(entry$nearby$distance_m, na.rm = TRUE) else NA_real_,
+            mean_distance_m = if ("distance_m" %in% names(entry$nearby)) mean(entry$nearby$distance_m, na.rm = TRUE) else NA_real_,
+            max_distance_m = if ("distance_m" %in% names(entry$nearby)) max(entry$nearby$distance_m, na.rm = TRUE) else NA_real_
+          )
+        }
+        { render_table(nearby_totals, caption = paste(entry$layer_display, "- Nearby Feature Totals")); invisible(NULL) }
+        cat("\n\n")
+        { render_grouped_tables(entry$nearby, caption_prefix = paste(entry$layer_display, "- Nearby Features")); invisible(NULL) }
+        cat("\n\n")
+      }
+    }
+  }
+}
+
+```
+
+# Layer Exclusions and Load Issues
+
+```{r layer-exclusions, results='asis'}
+if (length(no_hit_layers) > 0) {
+  cat("## Layers With No AOI Match\n\n")
+  no_hit_df <- data.frame(
+    Focus = vapply(no_hit_layers, function(x) x$focus, character(1)),
+    Layer = vapply(no_hit_layers, function(x) x$layer_display, character(1)),
+    Geometry = vapply(no_hit_layers, function(x) x$geometry, character(1)),
+    outside_distance_m = vapply(no_hit_layers, function(x) ifelse(is.na(x$outside_distance_m), NA, x$outside_distance_m), numeric(1))
+  )
+  { render_table(no_hit_df, caption = "Configured layers with no direct overlap and no nearby features"); invisible(NULL) }
+  cat("\n\n")
+}
+
+if (length(skipped_layers) > 0) {
+  cat("## Skipped Layers (Load Issues)\n\n")
+  skipped_df <- data.frame(
+    Focus = vapply(skipped_layers, function(x) x$focus, character(1)),
+    Layer = vapply(skipped_layers, function(x) x$layer_display, character(1)),
+    Geometry = vapply(skipped_layers, function(x) x$geometry, character(1)),
+    Reason = vapply(skipped_layers, function(x) x$reason, character(1))
+  )
+  { render_table(skipped_df, caption = "Configured layers skipped because source data could not be loaded"); invisible(NULL) }
+  cat("\n\n")
+}
+```
+
+# Summary
+
+```{r summary-table, results='asis'}
+if (length(layer_outputs) == 0) {
+  cat("*No layer hits to summarise.*\n\n")
+} else {
+  summary_df <- data.frame(
+    Focus = vapply(layer_outputs, function(x) x$focus, character(1)),
+    Layer = vapply(layer_outputs, function(x) x$layer_display, character(1)),
+    Geometry = vapply(layer_outputs, function(x) x$layer_geom, character(1)),
+    Spatial_Request = vapply(layer_outputs, function(x) x$spatial_need, character(1)),
+    Direct_Hit = vapply(layer_outputs, function(x) ifelse(x$has_direct, "Yes", "No"), character(1)),
+    Outside_Distance_m = vapply(layer_outputs, function(x) ifelse(is.na(x$outside_distance), NA, x$outside_distance), numeric(1)),
+    Nearby_Hit = vapply(layer_outputs, function(x) ifelse(is.null(x$nearby), "No", "Yes"), character(1))
+  )
+  { render_table(summary_df, caption = "Detected layer results by focus"); invisible(NULL) }
+}
+```
+
+---
+
+*Report generated by the BC Gov Referral Spatial Analysis tool.*
+*See README.md for instructions on updating reference layers and running this report.*
