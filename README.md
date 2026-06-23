@@ -32,8 +32,8 @@ Automated spatial analysis tool for ecosystem referral support process. This too
 1. **Clone this repository:**
 
    ```bash
-   git clone <repository-url>
-   cd bcgov-referral-process
+   git clone https://github.com/bcgov/Skeena_ecosystem_referrals
+   cd Skeena_ecosystem_referrals
    ```
 
 2. **Add your spatial data files** to `data/input/` (see [Adding Reference Layers](#adding-or-updating-reference-layers)).
